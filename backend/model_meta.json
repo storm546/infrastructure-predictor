@@ -1,0 +1,23 @@
+{
+  "categorical_cols": [
+    "repair_type",
+    "object_type",
+    "season",
+    "authority_type"
+  ],
+  "numeric_cols": [
+    "value_log",
+    "value_bgn_normalized",
+    "num_offers",
+    "month",
+    "day_of_week",
+    "has_annex",
+    "annex_extension_days",
+    "eu_financed"
+  ],
+  "target": "actual_days",
+  "test_mae": 79.08108520507812,
+  "test_r2": 0.5219900608062744,
+  "trained_at": "2026-06-19T23:51:32.634554",
+  "num_samples": 186
+}

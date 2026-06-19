@@ -1,0 +1,20 @@
+[Unit]
+Description=Infrastructure Repair Predictor - FastAPI Backend
+After=network.target
+
+[Service]
+Type=simple
+User=Adrian
+WorkingDirectory=C:/Users/Adrian/infrastructure-predictor/backend
+Environment="PYTHONIOENCODING=utf-8"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=C:/Users/Adrian/AppData/Local/Programs/Python/Python312/python.exe -X utf8 -m uvicorn main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+
+# Logging
+StandardOutput=append:/opt/infrastructure-predictor/backend.log
+StandardError=append:/opt/infrastructure-predictor/backend-error.log
+
+[Install]
+WantedBy=multi-user.target

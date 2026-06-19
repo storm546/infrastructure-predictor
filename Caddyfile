@@ -1,0 +1,75 @@
+# Caddyfile - Reverse Proxy for Infrastructure Repair Predictor
+#
+# Serves:
+#   /            -> Frontend static files (Vite build output)
+#   /api/*       -> FastAPI backend (port 8000)
+#   /webhook     -> Webhook listener (port 9000)
+#
+# Caddy auto-provisions Let's Encrypt HTTPS certificates.
+# Adjust the domain name below to your actual domain.
+#
+# Deploy: copy to /etc/caddy/Caddyfile and run `systemctl reload caddy`
+
+# ---------------------------------------------------------------------------
+# Local development (HTTP only, no domain)
+# ---------------------------------------------------------------------------
+:80 {
+    # Serve frontend static files
+    root * /opt/infrastructure-predictor/frontend/dist
+
+    # SPA fallback: serve index.html for any unknown path
+    try_files {path} /index.html
+
+    # Forward /api/* to FastAPI backend
+    handle_path /api/* {
+        reverse_proxy localhost:8000
+    }
+
+    # Forward /webhook to webhook listener
+    handle_path /webhook {
+        reverse_proxy localhost:9000
+    }
+
+    # Enable gzip compression
+    encode gzip zstd
+
+    # Security headers
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy strict-origin-when-cross-origin
+    }
+
+    # Logging
+    log {
+        output file /var/log/caddy/infrastructure-predictor.log
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Production (HTTPS with auto-SSL, uncomment and set your domain)
+# ---------------------------------------------------------------------------
+# infra-predictor.stormlabs.cloud {
+#     root * /opt/infrastructure-predictor/frontend/dist
+#     try_files {path} /index.html
+#
+#     handle_path /api/* {
+#         reverse_proxy localhost:8000
+#     }
+#
+#     handle_path /webhook {
+#         reverse_proxy localhost:9000
+#     }
+#
+#     encode gzip zstd
+#
+#     header {
+#         X-Content-Type-Options nosniff
+#         X-Frame-Options DENY
+#         Referrer-Policy strict-origin-when-cross-origin
+#     }
+#
+#     log {
+#         output file /var/log/caddy/infrastructure-predictor.log
+#     }
+# }
