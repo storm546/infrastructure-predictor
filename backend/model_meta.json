@@ -1,23 +1,28 @@
 {
+  "target": "contracted_days",
+  "target_note": "Real contracted execution period (durationInDays) from OCDS; duration agreed at signing, not actual completion time.",
+  "data_source": "Open Contracting / DIGIWHIST Bulgaria (opentender.eu), CC BY-NC-SA 4.0",
   "categorical_cols": [
-    "repair_type",
-    "object_type",
+    "cpv4",
+    "method",
+    "buyer_type",
     "season",
-    "authority_type"
+    "postal_region"
   ],
   "numeric_cols": [
     "value_log",
-    "value_bgn_normalized",
     "num_offers",
-    "month",
-    "day_of_week",
-    "has_annex",
-    "annex_extension_days",
-    "eu_financed"
+    "month"
   ],
-  "target": "actual_days",
-  "test_mae": 79.08108520507812,
-  "test_r2": 0.5219900608062744,
-  "trained_at": "2026-06-19T23:51:32.634554",
-  "num_samples": 186
+  "num_samples": 12605,
+  "train_mae": 85.32950173460837,
+  "train_r2": 0.5865275839443584,
+  "test_mae": 91.52326298327448,
+  "test_rmse": 159.25096519080475,
+  "test_r2": 0.5112221779643613,
+  "baseline_mae": 131.62982875617917,
+  "mae_improvement_pct": 30.469207589105785,
+  "cv_mae_mean": 94.73339817723505,
+  "cv_mae_std": 3.9118028812327643,
+  "trained_at": "2026-06-19T22:08:53.739895+00:00"
 }

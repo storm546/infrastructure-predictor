@@ -8,6 +8,9 @@ env/
 dist/
 build/
 model.joblib
+# Raw OCDS data (~84 MB); regenerate with backend/fetch_data.py
+backend/data/raw/ocds/
+*.jsonl.gz
 *.egg-info/
 .DS_Store
 .pytest_cache/

@@ -8,7 +8,7 @@ const MONTHS = [
   "July", "August", "September", "October", "November", "December"
 ];
 
-const DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+const METHODS = ["open", "collect_offers", "direct", "restricted", "other"];
 
 function App() {
   const [meta, setMeta] = useState<FeatureMeta | null>(null);
@@ -18,17 +18,14 @@ function App() {
   const [error, setError] = useState<string | null>(null);
 
   const [form, setForm] = useState<PredictRequest>({
-    repair_type: "road_repair",
-    object_type: "строителство",
+    repair_type: "roads_highways",
+    method: "open",
+    buyer_type: "municipality",
     season: "summer",
-    authority_type: "municipality",
     value_bgn: 150000,
     num_offers: 3,
-    eu_financed: 0,
     month: 6,
-    day_of_week: 2,
-    has_annex: 0,
-    annex_extension_days: 0,
+    postal_region: "",
   });
 
   useEffect(() => {
@@ -79,9 +76,11 @@ function App() {
   return (
     <div className="app">
       <header className="header">
-        <h1>Infrastructure Repair Predictor</h1>
+        <h1>Infrastructure Contract Duration Predictor</h1>
         <p className="subtitle">
-          XGBoost model trained on {meta?.num_samples ?? "—"} real Bulgarian public procurement records
+          XGBoost trained on {meta?.num_samples ?? "—"} real Bulgarian construction
+          contracts (CPV&nbsp;45, 2020–2023). Predicts the <strong>contracted</strong>{" "}
+          execution period agreed at signing — not actual on-site completion time.
         </p>
       </header>
 
@@ -89,19 +88,19 @@ function App() {
         <form onSubmit={handleSubmit} className="form">
           <div className="grid">
             <label>
-              Repair Type
+              Construction Type
               <select name="repair_type" value={form.repair_type} onChange={handleChange}>
                 {meta?.repair_types.map((t) => (
-                  <option key={t} value={t}>{t}</option>
+                  <option key={t} value={t}>{t.replace(/_/g, " ")}</option>
                 ))}
               </select>
             </label>
 
             <label>
-              Object Type
-              <select name="object_type" value={form.object_type} onChange={handleChange}>
-                {meta?.object_types.map((t) => (
-                  <option key={t} value={t}>{t}</option>
+              Procurement Method
+              <select name="method" value={form.method} onChange={handleChange}>
+                {(meta?.methods?.length ? meta.methods : METHODS).map((t) => (
+                  <option key={t} value={t}>{t.replace(/_/g, " ")}</option>
                 ))}
               </select>
             </label>
@@ -116,8 +115,8 @@ function App() {
             </label>
 
             <label>
-              Authority Type
-              <select name="authority_type" value={form.authority_type} onChange={handleChange}>
+              Buyer Type
+              <select name="buyer_type" value={form.buyer_type} onChange={handleChange}>
                 {meta?.authority_types.map((a) => (
                   <option key={a} value={a}>{a}</option>
                 ))}
@@ -137,7 +136,7 @@ function App() {
             </label>
 
             <label>
-              Number of Offers
+              Number of Bids
               <input
                 type="number"
                 name="num_offers"
@@ -158,41 +157,20 @@ function App() {
             </label>
 
             <label>
-              Day of Week
-              <select name="day_of_week" value={form.day_of_week} onChange={handleChange}>
-                {DAYS.map((d, i) => (
-                  <option key={i} value={i}>{d}</option>
-                ))}
-              </select>
-            </label>
-
-            <label className="checkbox-label">
+              Postal Region (first 2 digits)
               <input
-                type="checkbox"
-                name="eu_financed"
-                checked={form.eu_financed === 1}
-                onChange={(e) =>
-                  setForm((f) => ({ ...f, eu_financed: e.target.checked ? 1 : 0 }))
-                }
+                type="text"
+                name="postal_region"
+                value={form.postal_region}
+                onChange={handleChange}
+                maxLength={2}
+                placeholder="e.g. 55"
               />
-              EU Financed
-            </label>
-
-            <label className="checkbox-label">
-              <input
-                type="checkbox"
-                name="has_annex"
-                checked={form.has_annex === 1}
-                onChange={(e) =>
-                  setForm((f) => ({ ...f, has_annex: e.target.checked ? 1 : 0 }))
-                }
-              />
-              Has Annexes
             </label>
           </div>
 
           <button type="submit" disabled={predicting} className="submit-btn">
-            {predicting ? "Predicting..." : "Predict Repair Duration"}
+            {predicting ? "Predicting..." : "Predict Contracted Duration"}
           </button>
         </form>
 
@@ -201,7 +179,7 @@ function App() {
         {result && (
           <div className="result">
             <div className="result-main">
-              <span className="result-label">Predicted Duration</span>
+              <span className="result-label">Predicted Contracted Duration</span>
               <span className="result-days">{result.predicted_days} days</span>
               <span className="result-months">
                 (~{(result.predicted_days / 30).toFixed(1)} months)
@@ -209,7 +187,7 @@ function App() {
             </div>
 
             <div className="result-risk">
-              <span className="result-label">Delay Risk</span>
+              <span className="result-label">Relative Duration</span>
               <span
                 className="risk-badge"
                 style={{ background: riskColors[result.delay_risk] }}
@@ -220,6 +198,8 @@ function App() {
 
             <div className="result-meta">
               <span>Model MAE: ±{result.model_info.test_mae?.toFixed(0)} days</span>
+              <span>Baseline MAE: ±{result.model_info.baseline_mae?.toFixed(0)} days</span>
+              <span>R²: {result.model_info.test_r2?.toFixed(2)}</span>
               <span>Trained: {result.model_info.trained_at?.slice(0, 10)}</span>
             </div>
           </div>
@@ -227,7 +207,7 @@ function App() {
       </main>
 
       <footer className="footer">
-        Data source: Bulgarian Public Procurement Agency via data.egov.bg
+        Data: Open Contracting / DIGIWHIST Bulgaria (opentender.eu) · CC BY-NC-SA 4.0
       </footer>
     </div>
   );

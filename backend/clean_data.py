@@ -1,399 +1,218 @@
 """
-clean_data.py - Transform raw Bulgarian procurement data into ML-ready features.
+clean_data.py - Transform raw OCDS procurement data into ML-ready features.
 
-Key transformations:
-  - Parse DD/MM/YYYY Bulgarian dates
-  - Extract repair_type from contract subjects (асфалтиране, ВиК, ремонт, etc.)
-  - Map dates to season, quarter, month features
-  - Derive actual_days from annex data + industry estimates
-  - One-hot encode categoricals
-  - Handle missing values
+Reads OCDS JSON-Lines (from fetch_data.py) and produces a clean table of
+Bulgarian *construction / infrastructure* contracts (CPV division 45).
+
+Key point: the target `contracted_days` is the REAL execution period the
+contracting authority published (tender.contractPeriod.durationInDays). It is
+the duration agreed at signing - NOT a synthesised/estimated value, and NOT the
+actual on-the-ground completion time (open data does not expose that).
 """
 
-import pandas as pd
-import numpy as np
-import re
-from datetime import datetime, timedelta
+import glob
+import gzip
+import json
+import math
 from pathlib import Path
-from collections import Counter
+
+import pandas as pd
 
 from geo_utils import extract_town, geocode_town
-from geo_lookup import lookup_street
-import re
 
 DATA_DIR = Path(__file__).parent / "data"
-RAW_DIR = DATA_DIR / "raw"
+RAW_DIR = DATA_DIR / "raw" / "ocds"
 PROCESSED_DIR = DATA_DIR / "processed"
 
-# Bulgarian repair type keywords → standardized categories
-REPAIR_KEYWORDS = {
-    "асфалтиране": "road_asphalt",
-    "асфалт": "road_asphalt",
-    "пътни": "road_repair",
-    "път": "road_repair",
-    "улиц": "road_repair",
-    "тротоар": "sidewalk",
-    "ВиК": "water_sewage",
-    "водоснабд": "water_sewage",
-    "канализация": "water_sewage",
-    "водопровод": "water_sewage",
-    "ремонт": "building_repair",
-    "строител": "construction",
-    "изграждане": "construction",
-    "реконструкция": "reconstruction",
-    "саниране": "renovation",
-    "енергийна ефективност": "energy_efficiency",
-    "мост": "bridge",
-    "парк": "parking_lot",
-    "площад": "public_space",
-    "осветление": "lighting",
-    "отопление": "heating",
-    "покрив": "roof",
-    "фасада": "facade",
-    "дограма": "windows",
-    "спорт": "sports_facility",
-    "училищ": "school",
-    "детска градин": "kindergarten",
-    "болниц": "hospital",
+EUR_BGN = 1.95583
+MIN_DAYS, MAX_DAYS = 5, 1800  # drop implausible / data-entry outliers
+
+# CPV division 45 sub-groups -> readable category (for display + filtering)
+CPV_LABELS = {
+    "4520": "site_prep_demolition",
+    "4521": "building_construction",
+    "4522": "civil_engineering",
+    "4523": "roads_highways",
+    "4524": "water_marine_works",
+    "4525": "other_civil_works",
+    "4526": "roof_structural",
+    "4531": "electrical_installation",
+    "4532": "insulation_works",
+    "4533": "plumbing_heating",
+    "4534": "fencing_railing",
+    "4500": "general_construction",
 }
 
-
-def parse_bg_date(date_str: str) -> datetime | None:
-    """Parse Bulgarian date format DD/MM/YYYY or DD.MM.YYYY."""
-    if not date_str or pd.isna(date_str):
-        return None
-
-    date_str = str(date_str).strip()
-    # Try DD/MM/YYYY
-    for fmt in ["%d/%m/%Y", "%d.%m.%Y", "%Y-%m-%d", "%d-%m-%Y"]:
-        try:
-            return datetime.strptime(date_str, fmt)
-        except ValueError:
-            continue
-    return None
+# EU funding signals in the contract title (best-effort, OCDS lacks a flag)
+EU_KEYWORDS = ("оперативна програма", "европейск", "ефрр", "еф рр", "опрр",
+               "осес", "пррд", "приоритет", "съфинансир", "ес ")
 
 
-def classify_repair_type(subject: str) -> str:
-    """Map contract subject text to standardized repair category."""
-    if not subject or pd.isna(subject):
-        return "other"
+def season(m: int) -> str:
+    return {12: "winter", 1: "winter", 2: "winter",
+            3: "spring", 4: "spring", 5: "spring",
+            6: "summer", 7: "summer", 8: "summer",
+            9: "autumn", 10: "autumn", 11: "autumn"}.get(m, "unknown")
 
-    subject_lower = str(subject).lower()
 
-    for keyword, category in REPAIR_KEYWORDS.items():
-        if keyword in subject_lower:
-            return category
-
+def method_group(d: str) -> str:
+    d = (d or "").lower()
+    if "открит" in d or "open" in d:
+        return "open"
+    if "събиране" in d or "collect" in d or "selective" in d:
+        return "collect_offers"
+    if "пряко" in d or "direct" in d or "negoti" in d:
+        return "direct"
+    if "ограничен" in d or "limited" in d or "restrict" in d:
+        return "restricted"
     return "other"
 
 
-def get_season(date_val: datetime) -> str:
-    """Map date to season."""
-    if date_val is None:
-        return "unknown"
-    m = date_val.month
-    if m in [12, 1, 2]:
-        return "winter"
-    elif m in [3, 4, 5]:
-        return "spring"
-    elif m in [6, 7, 8]:
-        return "summer"
-    else:
-        return "autumn"
+def buyer_type(name: str) -> str:
+    n = (name or "").lower()
+    if any(w in n for w in ["община", "кметство", "район"]):
+        return "municipality"
+    if any(w in n for w in ["министерств", "агенци", "област", "държав"]):
+        return "state"
+    if any(w in n for w in ["еоод", "еад", " ад", "оод", "вик", "топлофикац"]):
+        return "utility"
+    if any(w in n for w in ["училищ", "детска", "болниц", "университет", "читалищ"]):
+        return "institution"
+    return "other"
 
 
-def estimate_completion_days(row: pd.Series) -> tuple[int, str]:
-    """
-    Estimate actual completion days for a contract.
-
-    Strategy:
-    1. If annex data indicates timeline extension, use that
-    2. Fall back to industry estimates based on object type + value
-
-    Returns (days, confidence: 'real'|'estimated')
-    """
-    obj_type = str(row.get("ОБЕКТ", "")).lower()
-    subject = str(row.get("ПРЕДМЕТ на договора", "")).lower()
-    value = float(row.get("СТОЙНОСТ при сключване", 0) or 0)
-    contract_date = row.get("contract_date_parsed")
-
-    # Base durations by object type (in days)
-    if "строителство" in obj_type:
-        # Construction projects: 3-24 months depending on value
-        if value > 1_000_000:
-            base_days = np.random.RandomState(hash(subject) % 2**32).randint(365, 730)
-        elif value > 100_000:
-            base_days = np.random.RandomState(hash(subject) % 2**32).randint(180, 545)
-        else:
-            base_days = np.random.RandomState(hash(subject) % 2**32).randint(90, 270)
-        confidence = "estimated"
-    elif "услуги" in obj_type:
-        base_days = np.random.RandomState(hash(subject) % 2**32).randint(30, 365)
-        confidence = "estimated"
-    else:  # доставки (supplies)
-        base_days = np.random.RandomState(hash(subject) % 2**32).randint(7, 90)
-        confidence = "estimated"
-
-    # Adjust for season: winter contracts take longer
-    if contract_date and contract_date.month in [11, 12, 1, 2]:
-        base_days = int(base_days * 1.2)
-
-    # Check annex data for real extensions (if merged)
-    annex_extensions = row.get("annex_extension_days", 0)
-    if annex_extensions and annex_extensions > 0:
-        base_days += annex_extensions
-        confidence = "semi_real"
-
-    return base_days, confidence
+def cpv_label(cpv: str) -> str:
+    return CPV_LABELS.get(cpv[:4], "other_construction")
 
 
-def extract_annex_extensions(annexes_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Analyze annex descriptions for timeline extensions.
-    Returns DataFrame with contract ID and extension_days.
-    """
-    if annexes_df.empty:
-        return pd.DataFrame()
+def parse_date(s):
+    if not s:
+        return None
+    try:
+        return pd.to_datetime(s)
+    except Exception:
+        return None
 
-    extensions = []
-    extension_patterns = [
-        (r"срок.*?(?:удължа|продължа|промен).*?(\d+)\s*(?:ден|дни|месец|годин)", "days"),
-        (r"удължаване.*?срок.*?(\d+)\s*(?:ден|дни|месец)", "days"),
-        (r"промяна.*?срок.*?(\d+)\s*(?:ден|дни)", "days"),
-    ]
 
-    for _, row in annexes_df.iterrows():
-        desc = str(row.get("ОПИСАНИЕ на измененията", ""))
-        contract_id = row.get("ID на поръчката", "")
-
-        ext_days = 0
-        for pattern, unit in extension_patterns:
-            matches = re.findall(pattern, desc, re.IGNORECASE)
-            for match in matches:
+def iter_releases():
+    files = sorted(glob.glob(str(RAW_DIR / "*.jsonl.gz")))
+    for path in files:
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
                 try:
-                    num = int(match)
-                    if "месец" in desc[max(0, desc.find(match) - 20):desc.find(match) + 20]:
-                        num *= 30
-                    elif "годин" in desc[max(0, desc.find(match) - 20):desc.find(match) + 20]:
-                        num *= 365
-                    ext_days += num
-                except ValueError:
-                    pass
-
-        if ext_days > 0:
-            extensions.append({"ID на поръчката": contract_id, "annex_extension_days": ext_days})
-
-    return pd.DataFrame(extensions)
+                    yield json.loads(line)
+                except Exception:
+                    continue
 
 
-def clean_and_engineer(contracts_df: pd.DataFrame, annexes_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Main cleaning and feature engineering pipeline.
-    """
-    df = contracts_df.copy()
+def build_rows():
+    rows = []
+    for rec in iter_releases():
+        t = rec.get("tender", {}) or {}
+        cp = t.get("contractPeriod") or {}
+        dur = cp.get("durationInDays")
+        if not isinstance(dur, (int, float)) or not (MIN_DAYS <= dur <= MAX_DAYS):
+            continue
 
-    # --- Parse dates ---
-    df["contract_date_parsed"] = df["ДОГОВОР ДАТА"].apply(parse_bg_date)
-    df["published_date_parsed"] = df["ПУБЛИКУВАН НА"].apply(parse_bg_date)
+        items = t.get("items") or []
+        cpv = str((items[0].get("classification") or {}).get("id", "")) if items else ""
+        if not cpv.startswith("45"):  # construction / infrastructure only
+            continue
 
-    # Drop rows where contract date couldn't be parsed
-    before = len(df)
-    df = df[df["contract_date_parsed"].notna()].copy()
-    print(f"  Dropped {before - len(df)} rows with unparseable dates")
+        val = t.get("value") or {}
+        amt = val.get("amount") or 0
+        if (val.get("currency") or "BGN").upper() == "EUR":
+            amt *= EUR_BGN
+        if not amt or amt <= 0:
+            continue
 
-    # --- Extract repair type ---
-    df["repair_type"] = df["ПРЕДМЕТ на договора"].apply(classify_repair_type)
+        tp = t.get("tenderPeriod") or {}
+        d = parse_date(tp.get("endDate")) or parse_date(rec.get("date"))
+        month = int(d.month) if d is not None else 0
 
-    # --- Season ---
-    df["season"] = df["contract_date_parsed"].apply(get_season)
-    df["quarter"] = df["contract_date_parsed"].apply(lambda d: f"Q{(d.month - 1) // 3 + 1}" if d else "unknown")
-    df["month"] = df["contract_date_parsed"].apply(lambda d: d.month if d else 0)
-    df["day_of_week"] = df["contract_date_parsed"].apply(lambda d: d.weekday() if d else -1)
+        buyer = (rec.get("buyer") or {}).get("name", "")
+        postal = ""
+        for p in (rec.get("parties") or []):
+            a = p.get("address") or {}
+            if "buyer" in (p.get("roles") or []) and a.get("postalCode"):
+                postal = str(a["postalCode"])
+                break
+            if a.get("postalCode") and not postal:
+                postal = str(a["postalCode"])
 
-    # --- Object type ---
-    df["object_type"] = df["ОБЕКТ"].fillna("unknown").str.lower()
-    df["object_type"] = df["object_type"].apply(
-        lambda x: x if x in ["строителство", "услуги", "доставки"] else "unknown"
-    )
+        town = extract_town(buyer)
+        lat, lng = geocode_town(town)
+        title = (t.get("title") or t.get("description") or "").strip()
+        eu = 1 if any(k in title.lower() for k in EU_KEYWORDS) else 0
 
-    # --- Numeric features ---
-    df["value_bgn"] = pd.to_numeric(df["СТОЙНОСТ при сключване"], errors="coerce").fillna(0)
-    df["value_log"] = np.log1p(df["value_bgn"])
-    df["num_offers"] = pd.to_numeric(df["БРОЙ ОФЕРТИ"], errors="coerce").fillna(0)
-    df["eu_financed"] = df["EU ФИНАНСИРАНЕ"].apply(
-        lambda x: 1 if str(x).strip() in ["1", "Да", "да"] else 0
-    )
-
-    # --- Contractor name standardization ---
-    df["contractor"] = df["ИЗПЪЛНИТЕЛ"].fillna("UNKNOWN").str.strip()
-    # Extract first company name (before ||| if multiple)
-    df["contractor"] = df["contractor"].apply(lambda x: x.split("|||")[0].strip())
-    # Normalize: remove location suffix
-    df["contractor"] = df["contractor"].apply(
-        lambda x: re.sub(r"\s*[-–]\s*\S+$", "", x) if len(x) > 5 else x
-    )
-
-    # --- Contracting authority ---
-    df["authority"] = df["ВЪЗЛОЖИТЕЛ"].fillna("UNKNOWN").str.strip()
-    df["authority_type"] = df["authority"].apply(
-        lambda x: "municipality" if any(w in x.lower() for w in ["община", "кметство", "район"])
-        else "state" if any(w in x.lower() for w in ["агенция", "министерство", "област"])
-        else "utility" if any(w in x.lower() for w in ["ец", "еад", "топлофикация", "вик"])
-        else "other"
-    )
-
-    # --- Town extraction ---
-    df["town"] = df.apply(
-        lambda r: extract_town(r["ВЪЗЛОЖИТЕЛ"], r.get("ПРЕДМЕТ на договора", "")),
-        axis=1
-    )
-    
-    # --- Geocoding: use static street lookup, fall back to town center with jitter ---
-    lats, lngs = [], []
-    for _, row in df.iterrows():
-        contract_num = str(row.get("ДОГОВОР НОМЕР", ""))
-        town = str(row.get("town", ""))
-        subject = str(row.get("ПРЕДМЕТ на договора", ""))
-        
-        # Try to extract a street name from the subject
-        coords = None
-        for q in '\u201e\u201c\u201d\u00ab\u00bb"':
-            subject_clean = subject.replace(q, ' ')
-        m = re.search(r'(?:ул\.|бул\.)\s+([^,]+?)(?:\s+(?:от|до)\s|,\s*|$)', subject_clean)
-        if m:
-            street_name = m.group(1).strip()
-            # Take first 1-2 words
-            words = street_name.split()
-            if len(words) > 2:
-                if len(words[0]) <= 3:
-                    street_name = ' '.join(words[:3])
-                else:
-                    street_name = ' '.join(words[:2])
-            coords = lookup_street(street_name, town)
-        
-        # Try neighborhood/district if no street match
-        if not coords:
-            m = re.search(r'(?:ж\.\s*к\.|район|кв\.|с\.)\s+(\S+(?:\s+\S+){0,1})', subject_clean)
-            if m:
-                coords = lookup_street(m.group(1).strip(), town)
-        
-        if coords:
-            lats.append(coords[0])
-            lngs.append(coords[1])
-        else:
-            # Fallback to town center with deterministic jitter
-            tc = geocode_town(town)
-            jitter = (hash(contract_num) % 1000 - 500) * 0.00015
-            jitter2 = (hash(contract_num + "X") % 1000 - 500) * 0.00015
-            lats.append(tc[0] + jitter)
-            lngs.append(tc[1] + jitter2)
-    
-    df["lat"] = lats
-    df["lng"] = lngs
-
-    # --- Merge annex extension data ---
-    if not annexes_df.empty:
-        ext_df = extract_annex_extensions(annexes_df)
-        if not ext_df.empty:
-            ext_agg = ext_df.groupby("ID на поръчката")["annex_extension_days"].sum().reset_index()
-            df = df.merge(ext_agg, on="ID на поръчката", how="left")
-            df["annex_extension_days"] = df["annex_extension_days"].fillna(0).astype(int)
-        else:
-            df["annex_extension_days"] = 0
-    else:
-        df["annex_extension_days"] = 0
-
-    # --- Estimate completion days ---
-    days_and_conf = df.apply(estimate_completion_days, axis=1)
-    df["actual_days"] = days_and_conf.apply(lambda x: x[0])
-    df["duration_confidence"] = days_and_conf.apply(lambda x: x[1])
-
-    # --- Additional features ---
-    df["has_annex"] = (df["annex_extension_days"] > 0).astype(int)
-    df["value_per_offer"] = df["value_bgn"] / (df["num_offers"] + 1)
-
-    # --- Currency: convert to BGN ---
-    # Most are BGN, but normalize EUR to BGN (1 EUR ≈ 1.95583 BGN)
-    df["value_bgn_normalized"] = df.apply(
-        lambda r: r["value_bgn"] * 1.95583 if str(r.get("ВАЛУТА", "BGN")).upper() == "EUR"
-        else r["value_bgn"],
-        axis=1
-    )
-
-    # --- Select final columns ---
-    keep_cols = [
-        "ID на поръчката", "ДОГОВОР НОМЕР", "contract_date_parsed",
-        "repair_type", "object_type", "season", "quarter", "month", "day_of_week",
-        "value_bgn", "value_log", "value_bgn_normalized",
-        "num_offers", "eu_financed", "contractor", "authority", "authority_type",
-        "has_annex", "annex_extension_days",
-        "actual_days", "duration_confidence",
-        "ПРЕДМЕТ на договора", "value_per_offer",
-        "town", "lat", "lng",
-    ]
-    # Only keep columns that exist
-    keep_cols = [c for c in keep_cols if c in df.columns]
-    result = df[keep_cols].copy()
-
-    print(f"  Final dataset: {len(result)} rows, {len(result.columns)} features")
-    rt = result['repair_type'].value_counts().to_dict()
-    print(f"  Top repair types: {dict(list(rt.items())[:5])}")
-    print(f"  Mean actual_days: {result['actual_days'].mean():.0f}")
-    print(f"  Duration confidence: {result['duration_confidence'].value_counts().to_dict()}")
-
-    return result
+        rows.append(dict(
+            id=rec.get("ocid", ""),
+            contract_number=str(t.get("id", "")),
+            subject=title[:300],
+            repair_type=cpv_label(cpv),
+            cpv4=cpv[:4],
+            object_type=t.get("mainProcurementCategory", "works"),
+            method=method_group(t.get("procurementMethodDetails")),
+            season=season(month),
+            month=month,
+            authority=buyer,
+            authority_type=buyer_type(buyer),
+            buyer_type=buyer_type(buyer),
+            town=town,
+            lat=lat,
+            lng=lng,
+            value_bgn=round(float(amt), 2),
+            value_log=math.log1p(amt),
+            num_offers=len(rec.get("bids") or []),
+            postal_region=(postal[:2] if postal else "??"),
+            eu_financed=eu,
+            contracted_days=float(dur),
+            duration_source="real_ocds",
+        ))
+    return rows
 
 
 def main():
     print("=" * 60)
-    print("  Data Cleaning & Feature Engineering")
+    print("  OCDS Data Cleaning & Feature Engineering")
     print("=" * 60)
 
-    # Load raw data
-    contracts_path = RAW_DIR / "contracts_raw.csv"
-    annexes_path = RAW_DIR / "annexes_raw.csv"
-
-    if not contracts_path.exists():
-        print("ERROR: raw contracts not found. Run fetch_data.py first.")
+    rows = build_rows()
+    if not rows:
+        print("ERROR: no rows produced. Run fetch_data.py first.")
         return
 
-    print(f"\nLoading raw data...")
-    contracts_df = pd.read_csv(contracts_path, encoding="utf-8-sig")
-    print(f"  Contracts: {len(contracts_df)} rows")
-
-    annexes_df = pd.DataFrame()
-    if annexes_path.exists():
-        annexes_df = pd.read_csv(annexes_path, encoding="utf-8-sig")
-        print(f"  Annexes: {len(annexes_df)} rows")
-
-    # Clean and engineer
-    print(f"\nCleaning & engineering features...")
-    clean_df = clean_and_engineer(contracts_df, annexes_df)
-
-    # Save
+    df = pd.DataFrame(rows)
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    clean_path = PROCESSED_DIR / "contracts_clean.csv"
-    clean_df.to_csv(clean_path, index=False, encoding="utf-8")
-    print(f"\n  Cleaned data saved → {clean_path}")
+    out = PROCESSED_DIR / "contracts_clean.csv"
+    df.to_csv(out, index=False, encoding="utf-8")
 
-    # Also save a feature list for the frontend
-    features_path = PROCESSED_DIR / "feature_metadata.json"
-    import json
+    print(f"\n  Construction contracts with REAL duration: {len(df)}")
+    print(f"  contracted_days mean={df.contracted_days.mean():.0f} "
+          f"median={df.contracted_days.median():.0f} std={df.contracted_days.std():.0f}")
+    print(f"  repair_type: {df.repair_type.value_counts().head(6).to_dict()}")
+    print(f"  Saved -> {out}")
+
     meta = {
-        "repair_types": sorted(clean_df["repair_type"].unique().tolist()),
-        "contractors": sorted(clean_df["contractor"].unique().tolist()),
-        "object_types": sorted(clean_df["object_type"].unique().tolist()),
-        "seasons": sorted(clean_df["season"].unique().tolist()),
-        "authority_types": sorted(clean_df["authority_type"].unique().tolist()),
-        "towns": sorted(clean_df["town"].unique().tolist()),
-        "num_samples": len(clean_df),
-        "mean_days": float(clean_df["actual_days"].mean()),
+        "repair_types": sorted(df["repair_type"].unique().tolist()),
+        "object_types": sorted(df["object_type"].unique().tolist()),
+        "methods": sorted(df["method"].unique().tolist()),
+        "seasons": ["winter", "spring", "summer", "autumn"],
+        "authority_types": sorted(df["authority_type"].unique().tolist()),
+        "towns": sorted([t for t in df["town"].unique().tolist() if t and t != "неизвестен"]),
+        "num_samples": len(df),
+        "mean_days": float(df["contracted_days"].mean()),
+        "target": "contracted_days",
+        "target_note": "Real contracted execution period (durationInDays) from OCDS; "
+                       "duration agreed at signing, not actual completion time.",
     }
-    with open(features_path, "w", encoding="utf-8") as f:
+    fm = PROCESSED_DIR / "feature_metadata.json"
+    with open(fm, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
-    print(f"  Feature metadata saved → {features_path}")
-
-    return clean_df
+    print(f"  Feature metadata saved -> {fm}")
 
 
 if __name__ == "__main__":

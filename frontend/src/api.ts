@@ -1,18 +1,15 @@
-// API client for the infrastructure predictor backend
+// API client for the infrastructure duration predictor backend
 const API_BASE = "/api";
 
 export interface PredictRequest {
   repair_type: string;
-  object_type: string;
+  method: string;
+  buyer_type: string;
   season: string;
-  authority_type: string;
   value_bgn: number;
   num_offers: number;
-  eu_financed: number;
   month: number;
-  day_of_week: number;
-  has_annex: number;
-  annex_extension_days: number;
+  postal_region: string;
 }
 
 export interface PredictResponse {
@@ -21,20 +18,25 @@ export interface PredictResponse {
   confidence: string;
   features_used: Record<string, unknown>;
   model_info: {
+    target: string;
+    target_note: string;
     test_mae: number;
     test_r2: number;
+    baseline_mae: number;
     trained_at: string;
   };
 }
 
 export interface FeatureMeta {
   repair_types: string[];
-  contractors: string[];
+  methods: string[];
   object_types: string[];
   seasons: string[];
   authority_types: string[];
+  towns: string[];
   mean_days: number;
   num_samples: number;
+  target_note: string;
 }
 
 export async function fetchMeta(): Promise<FeatureMeta> {
